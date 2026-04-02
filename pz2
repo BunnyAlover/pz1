@@ -1,0 +1,112 @@
+import cv2
+import os
+import yt_dlp
+from pathlib import Path
+
+
+def download_video(url, quality='720'):
+
+    out_tmpl = 'downloaded_video.%(ext)s'
+
+    ydl_opts = {
+        'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best',
+        'outtmpl': out_tmpl,
+        'quiet': False,
+        'noplaylist': True,
+    }
+
+    print(f"скачивание: {url}")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
+
+
+def extract_frames(video_path, output_folder, target_fps=1, max_frames=500, resize_width=None):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    video = cv2.VideoCapture(video_path)
+    if not video.isOpened():
+        print("ошибка: не удалось открыть видео файл.")
+        return
+
+    source_fps = video.get(cv2.CAP_PROP_FPS)
+    if source_fps == 0:
+        print("ошибка: не удалось определить fps исходного видео.")
+        return
+
+    # расчет шага кадров
+    hop = round(source_fps / target_fps)
+    if hop < 1:
+        hop = 1
+
+    print(f"исходный fps: {source_fps:.2f}. сохраняем каждый {hop}-й кадр.")
+
+    count = 0
+    saved_count = 0
+
+    while True:
+        success, frame = video.read()
+        if not success or saved_count >= max_frames:
+            if saved_count >= max_frames:
+                print(f"достигнут лимит в {max_frames} кадров. прерываю обработку.")
+            break
+
+        if count % hop == 0:
+            # оптимизация: уменьшаем размер кадра
+            if resize_width:
+                height, width = frame.shape[:2]
+                ratio = resize_width / float(width)
+                new_size = (resize_width, int(height * ratio))
+                frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+            frame_name = f"frame_{saved_count:05d}.jpg"
+            frame_path = os.path.join(output_folder, frame_name)
+
+            # оптимизация: качество сжатия 80 вместо дефолтных 95 экономит до 40% места
+            cv2.imwrite(frame_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            saved_count += 1
+
+        count += 1
+
+    video.release()
+    print(f"обработка завершена. сохранено кадров: {saved_count} в папку '{output_folder}'")
+
+
+def main():
+    print("--- оптимизированный скрипт нарезки видео ---")
+
+    choice = input("выберите источник (1 - ссылка, 2 - локальный файл): ").strip()
+
+    video_source = ""
+    if choice == '1':
+        url = input("введите ссылку: ").strip()
+        quality = input("введите макс. высоту (напр. 480, 720): ").strip() or "720"
+        try:
+            video_source = download_video(url, quality)
+        except Exception as e:
+            print(f"ошибка при скачивании: {e}")
+            return
+    else:
+        video_source = input("введите путь к файлу: ").strip()
+        if not os.path.exists(video_source):
+            print("ошибка: файл не найден.")
+            return
+
+    # параметры оптимизации
+    target_fps = float(input("кадров в секунду (напр. 0.5): ") or 1.0)
+    max_frames = int(input("лимит кадров (напр. 300): ") or 500)
+    resize_width = input("ширина кадра для ресайза (напр. 640, оставьте пустым для оригинала): ").strip()
+    resize_width = int(resize_width) if resize_width else None
+
+    output_dir = input("папка для кадров: ").strip() or "output_frames"
+
+    extract_frames(video_source, output_dir, target_fps, max_frames, resize_width)
+
+    if choice == '1' and os.path.exists(video_source):
+        if input(f"удалить временный файл {video_source}? (y/n): ").lower() == 'y':
+            os.remove(video_source)
+
+
+if __name__ == "__main__":
+    main()
