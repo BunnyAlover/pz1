@@ -1,0 +1,79 @@
+import cv2
+import easyocr
+import yt_dlp
+import os
+
+
+def read_text_from_video(video_source):
+    temp_filename = None
+
+    if video_source.startswith('http://') or video_source.startswith('https://'):
+        print("идет загрузка видео... это может занять несколько секунд...")
+        try:
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': 'temp_video_%(id)s.%(ext)s',
+                'quiet': True,
+                'noplaylist': True,
+                'socket_timeout': 60,
+                'retries': 10
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_source, download=True)
+                video_source = ydl.prepare_filename(info)
+                temp_filename = video_source
+        except Exception as e:
+            print(f"ошибка скачивания видео: {e}")
+            return
+
+    reader = easyocr.Reader(['ru', 'en'])
+
+    cap = cv2.VideoCapture(video_source)
+
+    if not cap.isOpened():
+        print("ошибка: невозможно открыть видеоряд.")
+        # удаляем файл, если opencv не смог его прочитать
+        if temp_filename and os.path.exists(temp_filename):
+            os.remove(temp_filename)
+        return
+
+    frame_index = 0
+    # шаг обработки кадров
+    step = 30
+
+    previous_text = ""
+
+    while True:
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        frame_index += 1
+
+        if frame_index % step == 0:
+            results = reader.readtext(frame)
+            texts = [text for _, text, _ in results]
+            text_result = " ".join(texts).strip()
+
+            if text_result and text_result != previous_text:
+                print(f"\n{text_result}") #текст на кадре {frame_index}:
+                previous_text = text_result
+        cv2.imshow('video stream', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if temp_filename and os.path.exists(temp_filename):
+        os.remove(temp_filename)
+
+
+if __name__ == "__main__":
+    video_url = input("введите прямую ссылку на видео: ")
+    if video_url.strip():
+        read_text_from_video(video_url.strip())
+    else:
+        print("ссылка не может быть пустой")
