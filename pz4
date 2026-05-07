@@ -1,0 +1,54 @@
+import sys
+import os
+import yt_dlp
+import whisper
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+
+def download_audio(url):
+    ydl_opts = {
+        'format': 'm4a/bestaudio/best',
+        'outtmpl': 'temp_audio.%(ext)s',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'm4a',
+        }],
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return 'temp_audio.m4a'
+
+
+def main():
+    # проверка: введена ли ссылка аргументом или ее нужно запросить
+    if len(sys.argv) > 1:
+        url = sys.argv[1]
+    else:
+        url = input("вставьте ссылку на видео с Rutube: ")
+
+    if not url:
+        print("ошибка: ссылка не может быть пустой")
+        return
+
+    try:
+        print("загрузка аудио...")
+        audio_file = download_audio(url)
+
+        print("загрузка модели whisper и распознавание...")
+        model = whisper.load_model("base")
+        result = model.transcribe(audio_file)
+
+        print("\nтекст из видео:")
+        print(result["text"])
+
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
+
+    except Exception as e:
+        print(f"произошла ошибка: {e}")
+
+
+if __name__ == "__main__":
+    main()
