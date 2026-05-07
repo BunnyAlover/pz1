@@ -1,0 +1,72 @@
+import sys
+import os
+import ssl
+import cv2
+import yt_dlp
+from ultralytics import YOLO
+ssl._create_default_https_context = ssl._create_unverified_context
+
+
+def download_video(url):
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': 'input_video.mp4',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return 'input_video.mp4'
+
+
+def process_video(video_path):
+    model = YOLO("yolov8n.pt")
+
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print("ошибка: не удалось открыть видеофайл")
+        return
+
+    print("обработка. нажмите 'q' для выхода.")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+        results = model(frame, stream=True, verbose=False)
+
+        for result in results:
+            annotated_frame = result.plot()
+            cv2.imshow("YOLO Object Detection", annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def main():
+    if len(sys.argv) > 1:
+        url = sys.argv[1]
+    else:
+        url = input("вставь ссылку на видео (Rutube/YouTube): ")
+
+    if not url:
+        return
+
+    try:
+        print("загрузка видео...")
+        video_file = download_video(url)
+
+        print("инициализация YOLO...")
+        process_video(video_file)
+
+        if os.path.exists(video_file):
+            os.remove(video_file)
+
+    except Exception as e:
+        print(f"произошла ошибка: {e}")
+
+
+if __name__ == "__main__":
+    main()
