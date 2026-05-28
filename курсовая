@@ -1,0 +1,473 @@
+import streamlit as st
+import cv2
+import os
+import re
+import json
+import yt_dlp
+import whisper
+import pytesseract
+import subprocess
+import pandas as pd
+import numpy as np
+import torch
+import plotly.express as px
+import ssl
+import gc
+from PIL import Image
+from ultralytics import YOLO
+from torchvision import models
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
+st.set_page_config(page_title="Анализ контента", layout="wide")
+
+st.title("Система модерации видеоконтента")
+
+os.makedirs("temp_frames", exist_ok=True)
+os.makedirs("temp_audio", exist_ok=True)
+
+
+def cleanup_temp_files():
+    files_to_remove = ["temp_video.mp4", "temp_audio/audio.wav", "temp_yolo_raw.mp4", "output_yolo.mp4"]
+    for f in files_to_remove:
+        if os.path.exists(f):
+            os.remove(f)
+    for f in os.listdir("temp_frames"):
+        if f.endswith(".jpg"):
+            os.remove(os.path.join("temp_frames", f))
+
+
+def format_time(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def extract_frames(video_path, max_frames=1800):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30
+    saved = 0
+    frame_step = int(fps)
+    while cap.isOpened() and saved < max_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, saved * frame_step)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cv2.imwrite(f"temp_frames/frame_{saved}.jpg", frame)
+        saved += 1
+    cap.release()
+    st.session_state['fps'] = fps
+
+
+def download_rutube(url):
+    ydl_opts = {
+        'outtmpl': 'temp_video.mp4',
+        'format': 'best',
+        'quiet': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return 'temp_video.mp4'
+
+
+def clean_text(text):
+    cleaned = re.sub(r'[^а-яА-ЯёЁa-zA-Z0-9\s.,!?_\[\]]', '', text)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+st.sidebar.header("Этапы сценария")
+task = st.sidebar.radio("Выберите шаг:", [
+    "1. Загрузка файла",
+    "2. Поиск объектов",
+    "3. Извлечение текста и аудио",
+    "4. Анализ на деструктив"
+])
+
+st.divider()
+
+video_path = "temp_video.mp4"
+
+if task == "1. Загрузка файла":
+    st.subheader("Шаг 1: Загрузка медиафайла для анализа")
+    upload_method = st.radio("Выберите источник видео:", ["Ссылка RuTube", "Локальный файл"])
+
+    if upload_method == "Ссылка RuTube":
+        url_input = st.text_input("Введите ссылку:")
+        if st.button("Скачать и подготовить"):
+            if url_input:
+                with st.spinner("Идет загрузка и нарезка кадров..."):
+                    cleanup_temp_files()
+                    for key in list(st.session_state.keys()):
+                        del st.session_state[key]
+                    download_rutube(url_input)
+                    extract_frames(video_path)
+                    st.success("Видео готово к обработке.")
+            else:
+                st.error("Ссылка не указана.")
+    else:
+        uploaded_file = st.file_uploader("Выберите видео на компьютере", type=['mp4', 'avi', 'mov'])
+        if uploaded_file is not None:
+            if st.button("Загрузить и подготовить"):
+                with st.spinner("Сохранение файла и нарезка кадров..."):
+                    cleanup_temp_files()
+                    for key in list(st.session_state.keys()):
+                        del st.session_state[key]
+                    with open(video_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    extract_frames(video_path)
+                    st.success("Видео готово к обработке.")
+
+elif task == "2. Поиск объектов":
+    st.subheader("Шаг 2: Детектирование объектов")
+
+    model_choice = st.radio("Выберите модель YOLO:", [
+        "nano (быстрая, базовая точность)",
+        "small (баланс скорости и деталей)",
+        "medium (медленная, высокая точность)"
+    ])
+
+    if "nano" in model_choice:
+        yolo_path = 'yolov8n.pt'
+    elif "small" in model_choice:
+        yolo_path = 'yolov8s.pt'
+    elif "medium" in model_choice:
+        yolo_path = 'yolov8m.pt'
+
+    if st.button("Запустить сканирование") and os.path.exists(video_path):
+        with st.spinner("Поиск объектов через YOLO..."):
+            try:
+                yolo_model = YOLO(yolo_path)
+                cap = cv2.VideoCapture(video_path)
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                if fps <= 0: fps = 30
+                st.session_state['fps'] = fps
+
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                st.session_state['is_vertical'] = height > width
+
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                temp_yolo = "temp_yolo_raw.mp4"
+                out_video = cv2.VideoWriter(temp_yolo, fourcc, fps, (width, height))
+
+                max_process_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if max_process_frames > fps * 300:
+                    max_process_frames = fps * 300
+
+                count = 0
+                yolo_events = []
+                last_boxes = []
+
+                yolo_bar = st.progress(0, text="Обработка видеокадров...")
+
+                process_step = max(1, int(fps / 2))
+
+                while cap.isOpened() and count < max_process_frames:
+                    ret, frame = cap.read()
+                    if not ret: break
+
+                    annotated_frame = frame.copy()
+
+                    if count % process_step == 0:
+                        results = yolo_model(frame, conf=0.4, verbose=False)
+
+                        last_boxes = []
+                        detected_in_frame = set()
+                        if len(results[0].boxes) > 0:
+                            names = yolo_model.names
+                            for box, cls in zip(results[0].boxes.xyxy.cpu().numpy(),
+                                                results[0].boxes.cls.cpu().numpy()):
+                                name = names[int(cls)]
+                                detected_in_frame.add(name)
+                                last_boxes.append((box, name))
+
+                        if detected_in_frame:
+                            time_sec = count / fps
+                            yolo_events.append({
+                                "time": time_sec,
+                                "frame": count,
+                                "objects": list(detected_in_frame)
+                            })
+
+                    for box, name in last_boxes:
+                        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        (tw, th), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                        cv2.rectangle(annotated_frame, (x1, y1 - th - 5), (x1 + tw, y1), (0, 255, 0), -1)
+                        cv2.putText(annotated_frame, name, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+                    out_video.write(annotated_frame)
+
+                    count += 1
+                    if count % 30 == 0:
+                        yolo_bar.progress(count / max_process_frames, text="Обработка видеокадров...")
+
+                cap.release()
+                out_video.release()
+
+                subprocess.run(["ffmpeg", "-y", "-i", temp_yolo, "-vcodec", "libx264", "output_yolo.mp4"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                st.session_state['yolo_events'] = yolo_events
+                st.session_state['frame_count'] = count
+
+                del yolo_model
+                gc.collect()
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+
+                st.success("Сканирование объектов завершено.")
+            except Exception as e:
+                st.error(f"Ошибка загрузки модели YOLO. Детали: {e}")
+
+    if 'yolo_events' in st.session_state:
+        if os.path.exists("output_yolo.mp4"):
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                st.video("output_yolo.mp4")
+
+elif task == "3. Извлечение текста и аудио":
+    st.subheader("Шаг 3: Извлечение текста и аудио")
+
+    whisper_size = st.radio("Выберите точность распознавания речи:",
+                            ["base (быстро)", "small (баланс)", "medium (точно)"])
+    selected_model_name = whisper_size.split()[0]
+
+    if st.button("Начать извлечение") and os.path.exists("temp_frames/frame_0.jpg"):
+        frames = [f for f in os.listdir("temp_frames") if f.endswith(".jpg")]
+        frames.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))
+
+        ocr_events = []
+        my_bar = st.progress(0, text="Распознавание текста...")
+        fps = st.session_state.get('fps', 30)
+
+        for idx, filename in enumerate(frames):
+            frame_idx = int(filename.split('_')[1].split('.')[0])
+            time_sec = float(frame_idx)
+
+            img = cv2.imread(os.path.join("temp_frames", filename))
+            h, w = img.shape[:2]
+            roi = img[int(h * 0.7):h, :]
+
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+            text = pytesseract.image_to_string(thresh, lang='rus+eng', config='--psm 6')
+            clean = clean_text(text)
+
+            if len(clean) >= 5:
+                ocr_events.append({"time": time_sec, "text": clean})
+
+            my_bar.progress((idx + 1) / len(frames), text="Распознавание текста...")
+
+        st.session_state['ocr_events'] = ocr_events
+
+        with st.spinner(f"Транскрибация аудиодорожки (модель {selected_model_name})..."):
+            audio_path = "temp_audio/audio.wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                 audio_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            whisper_model = whisper.load_model(selected_model_name)
+            audio_result = whisper_model.transcribe(audio_path, condition_on_previous_text=False, word_timestamps=True)
+
+            audio_events = []
+            for segment in audio_result["segments"]:
+                words_data = []
+                if "words" in segment:
+                    for w in segment["words"]:
+                        words_data.append({
+                            "word": clean_text(w["word"]),
+                            "start": w["start"],
+                            "end": w["end"]
+                        })
+
+                audio_events.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "text": clean_text(segment["text"]),
+                    "words": words_data
+                })
+
+            st.session_state['audio_events'] = audio_events
+
+            del whisper_model
+            gc.collect()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
+        st.success("Текст и аудио извлечены с таймкодами.")
+
+    if 'audio_events' in st.session_state:
+        st.write("Распознанные субтитры из аудиодорожки:")
+        audio_df = pd.DataFrame(st.session_state['audio_events'])
+        if 'words' in audio_df.columns:
+            audio_df = audio_df.drop(columns=['words'])
+        audio_df['start'] = audio_df['start'].apply(format_time)
+        audio_df['end'] = audio_df['end'].apply(format_time)
+        audio_df.columns = ['Начало', 'Конец', 'Текст']
+        st.dataframe(audio_df, use_container_width=True)
+
+elif task == "4. Анализ на деструктив":
+    st.subheader("Шаг 4: Формирование отчета по встроенным словарям")
+
+    if st.button("Провести модерацию"):
+        if 'yolo_events' not in st.session_state or 'audio_events' not in st.session_state:
+            st.warning("Для формирования отчета необходимо выполнить предыдущие шаги.")
+        else:
+            with st.spinner("Сборка отчета (локальный алгоритм)..."):
+                yolo = st.session_state['yolo_events']
+                audio = st.session_state['audio_events']
+                ocr = st.session_state.get('ocr_events', [])
+                fps = st.session_state.get('fps', 30)
+                fc = st.session_state.get('frame_count', 0)
+                duration = fc / fps if fps > 0 else 0
+
+                keywords = {
+                    "alcohol": ["алкоголь", "водка", "пиво", "вино", "бухать", "выпить", "пьяный"],
+                    "drugs": ["наркотики", "кокаин", "героин", "мефедрон", "закладка", "соль", "спайс", "экстази"],
+                    "violence": ["убить", "кровь", "драка", "оружие", "нож", "пистолет", "избить", "насилие"],
+                    "extremism": ["теракт", "взрыв", "бомба", "террорист"],
+                    "ludomania": ["казино", "ставки", "рулетка", "1xbet", "выигрыш", "джекпот", "слоты"],
+                    "smoking": ["сигарета", "курить", "вейп", "снюс", "табак", "сигара", "кальян", "электронка"],
+                    "vandalism": ["граффити", "разбить", "сломать", "вандал", "баллончик", "спрей"],
+                    "lgbt": ["гей", "лесбиянка", "трансгендер", "транс", "лгбт"],
+                    "profanity": ["__", "beep", "пик", "сигнал", "блять", "сука", "пиздец", "ебать", "хуй", "нахуй",
+                    "fuck", "shit", "bitch"]
+                }
+
+                yolo_map = {
+                    "bottle": "alcohol",
+                    "wine glass": "alcohol",
+                    "cup": "alcohol",
+                    "knife": "violence",
+                    "baseball bat": "violence"
+                }
+
+                detections = []
+
+
+                def add_detection(start_sec, end_sec, subclass, source_type, conf):
+                    detections.append({
+                        "startFrame": int(start_sec * fps),
+                        "endFrame": int(end_sec * fps),
+                        "start_time": format_time(start_sec),
+                        "end_time": format_time(end_sec),
+                        "time_interval": f"{format_time(start_sec)} - {format_time(end_sec)}",
+                        "subclass": subclass,
+                        "confidence": conf,
+                        "type": source_type
+                    })
+
+
+                for a in audio:
+                    text = a['text'].lower()
+                    for cat, words in keywords.items():
+                        if cat == "smoking" and "без табака" in text:
+                            continue
+
+                        matched_kws = [w for w in words if w in text]
+                        if matched_kws:
+                            if a.get("words"):
+                                for w_info in a["words"]:
+                                    w_text = w_info["word"].lower()
+                                    if any(kw in w_text for kw in matched_kws):
+                                        start_t = w_info["start"]
+                                        end_t = max(w_info["end"], start_t + 1.0)
+                                        add_detection(start_t, end_t, cat, "audio", 0.95)
+                            else:
+                                add_detection(a['start'], a['end'], cat, "audio", 0.95)
+
+                for o in ocr:
+                    text = o['text'].lower()
+                    for cat, words in keywords.items():
+                        if cat == "smoking" and "без табака" in text:
+                            continue
+                        if any(w in text for w in words):
+                            add_detection(o['time'], o['time'] + 2, cat, "video", 0.85)
+
+                for y in yolo:
+                    for obj in y['objects']:
+                        if obj in yolo_map:
+                            add_detection(y['time'], y['time'] + 1, yolo_map[obj], "video", 0.80)
+
+                report = {
+                    "report_type": "TIME_BASED_REPORT",
+                    "source_info": {
+                        "frameCount": fc,
+                        "fps": fps,
+                        "video_duration_formatted": format_time(duration)
+                    },
+                    "detections": detections
+                }
+
+                st.session_state['final_report'] = report
+                st.success("Отчет готов.")
+
+    if 'final_report' in st.session_state:
+        report_data = st.session_state['final_report']
+
+        raw_detections = report_data.get('detections', [])
+        df = pd.DataFrame(raw_detections)
+
+        dummy_data = [
+            {'start_time': '00:00:00', 'end_time': '00:00:00', 'subclass': '_empty', 'type': 'audio'},
+            {'start_time': '00:00:00', 'end_time': '00:00:00', 'subclass': '_empty', 'type': 'video'}
+        ]
+
+        if df.empty:
+            df = pd.DataFrame(dummy_data)
+        else:
+            df = pd.concat([df, pd.DataFrame(dummy_data)], ignore_index=True)
+
+        df['start_dt'] = pd.to_datetime("1970-01-01 " + df['start_time'].fillna('00:00:00'))
+        df['end_dt'] = pd.to_datetime("1970-01-01 " + df['end_time'].fillna('00:00:00'))
+
+        duration_formatted = report_data['source_info']['video_duration_formatted']
+        start_time_limit = pd.to_datetime("1970-01-01 00:00:00")
+        end_time_limit = pd.to_datetime("1970-01-01 " + duration_formatted)
+
+        color_map = {'_empty': 'rgba(0,0,0,0)'}
+        palette = px.colors.qualitative.Plotly
+        unique_categories = [c for c in df['subclass'].unique() if c != '_empty']
+        for i, cat in enumerate(unique_categories):
+            color_map[cat] = palette[i % len(palette)]
+
+        fig = px.timeline(
+            df,
+            x_start="start_dt",
+            x_end="end_dt",
+            y="type",
+            color="subclass",
+            color_discrete_map=color_map,
+            title="Хронология деструктивного контента",
+            height=250
+        )
+        fig.update_yaxes(title="Источник", categoryorder="array", categoryarray=["audio", "video"])
+        fig.update_xaxes(
+            tickformat="%M:%S",
+            title="Время",
+            range=[start_time_limit, end_time_limit]
+        )
+
+        fig.for_each_trace(lambda trace: trace.update(showlegend=False) if trace.name == "_empty" else ())
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        if len(raw_detections) == 0:
+            st.info("Деструктивный контент не найден.")
+
+        st.json(report_data)
+
+        json_string = json.dumps(report_data, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="Скачать отчет JSON",
+            file_name="moderation_report.json",
+            mime="application/json",
+            data=json_string,
+        )
