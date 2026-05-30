@@ -13,9 +13,15 @@ import torch
 import plotly.express as px
 import ssl
 import gc
+import requests
 from PIL import Image
 from ultralytics import YOLO
-from torchvision import models
+
+try:
+    import pymorphy3
+except ImportError:
+    st.error("библиотека pymorphy3 не установлена. открой терминал и введи: pip install pymorphy3")
+    st.stop()
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -25,6 +31,11 @@ st.title("Система модерации видеоконтента")
 
 os.makedirs("temp_frames", exist_ok=True)
 os.makedirs("temp_audio", exist_ok=True)
+
+
+@st.cache_resource
+def get_morph_analyzer():
+    return pymorphy3.MorphAnalyzer()
 
 
 def cleanup_temp_files():
@@ -62,17 +73,6 @@ def extract_frames(video_path, max_frames=1800):
     st.session_state['fps'] = fps
 
 
-def download_rutube(url):
-    ydl_opts = {
-        'outtmpl': 'temp_video.mp4',
-        'format': 'best',
-        'quiet': True
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return 'temp_video.mp4'
-
-
 def clean_text(text):
     cleaned = re.sub(r'[^а-яА-ЯёЁa-zA-Z0-9\s.,!?_\[\]]', '', text)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
@@ -82,7 +82,7 @@ def clean_text(text):
 st.sidebar.header("Этапы сценария")
 task = st.sidebar.radio("Выберите шаг:", [
     "1. Загрузка файла",
-    "2. Поиск объектов",
+    "2. Поиск объектов (YOLO-World)",
     "3. Извлечение текста и аудио",
     "4. Анализ на деструктив"
 ])
@@ -93,7 +93,7 @@ video_path = "temp_video.mp4"
 
 if task == "1. Загрузка файла":
     st.subheader("Шаг 1: Загрузка медиафайла для анализа")
-    upload_method = st.radio("Выберите источник видео:", ["Ссылка RuTube", "Локальный файл"])
+    upload_method = st.radio("Выберите источник видео:", ["Локальный файл", "Ссылка RuTube"])
 
     if upload_method == "Ссылка RuTube":
         url_input = st.text_input("Введите ссылку:")
@@ -103,7 +103,11 @@ if task == "1. Загрузка файла":
                     cleanup_temp_files()
                     for key in list(st.session_state.keys()):
                         del st.session_state[key]
-                    download_rutube(url_input)
+
+                    ydl_opts = {'outtmpl': 'temp_video.mp4', 'format': 'best', 'quiet': True}
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url_input])
+
                     extract_frames(video_path)
                     st.success("Видео готово к обработке.")
             else:
@@ -121,26 +125,46 @@ if task == "1. Загрузка файла":
                     extract_frames(video_path)
                     st.success("Видео готово к обработке.")
 
-elif task == "2. Поиск объектов":
-    st.subheader("Шаг 2: Детектирование объектов")
+elif task == "2. Поиск объектов (YOLO-World)":
+    st.subheader("Шаг 2: Детектирование объектов по текстовым запросам")
 
-    model_choice = st.radio("Выберите модель YOLO:", [
-        "nano (быстрая, базовая точность)",
-        "small (баланс скорости и деталей)",
-        "medium (медленная, высокая точность)"
-    ])
+    st.write(
+        "Алгоритм YOLO-World находит предметы по текстовому описанию и выдает точные рамки с процентом уверенности.")
 
-    if "nano" in model_choice:
-        yolo_path = 'yolov8n.pt'
-    elif "small" in model_choice:
-        yolo_path = 'yolov8s.pt'
-    elif "medium" in model_choice:
-        yolo_path = 'yolov8m.pt'
+    conf_thresh = 0.70
+    selected_yolo_model = "yolov8s-worldv2.pt"
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd_dir = os.getcwd()
+
+    possible_paths = [
+        os.path.join(script_dir, selected_yolo_model),
+        os.path.join(cwd_dir, selected_yolo_model),
+        selected_yolo_model
+    ]
+
+    model_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            model_path = p
+            break
 
     if st.button("Запустить сканирование") and os.path.exists(video_path):
-        with st.spinner("Поиск объектов через YOLO..."):
+        if not model_path:
+            st.error("системный файл модели не найден в рабочей директории.")
+            st.stop()
+
+        with st.spinner(f"Поиск объектов через {selected_yolo_model}..."):
             try:
-                yolo_model = YOLO(yolo_path)
+                yolo_model = YOLO(model_path)
+
+                custom_classes = [
+                    "person smoking a cigarette", "white cigarette", "cigarette in mouth", "cigar",
+                    "small white pill bottle", "small orange pill bottle", "white medical pills", "medical syringe",
+                    "beer bottle", "wine bottle", "liquor bottle", "glass of whiskey", "glass of wine", "glass of beer"
+                ]
+                yolo_model.set_classes(custom_classes)
+
                 cap = cv2.VideoCapture(video_path)
                 fps = int(cap.get(cv2.CAP_PROP_FPS))
                 if fps <= 0: fps = 30
@@ -148,13 +172,15 @@ elif task == "2. Поиск объектов":
 
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                st.session_state['is_vertical'] = height > width
+                frame_area = width * height
 
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 temp_yolo = "temp_yolo_raw.mp4"
                 out_video = cv2.VideoWriter(temp_yolo, fourcc, fps, (width, height))
 
                 max_process_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if max_process_frames <= 0:
+                    max_process_frames = fps * 180
                 if max_process_frames > fps * 300:
                     max_process_frames = fps * 300
 
@@ -162,7 +188,7 @@ elif task == "2. Поиск объектов":
                 yolo_events = []
                 last_boxes = []
 
-                yolo_bar = st.progress(0, text="Обработка видеокадров...")
+                yolo_bar = st.progress(0.0, text="Подготовка к сканированию...")
 
                 process_step = max(1, int(fps / 2))
 
@@ -173,38 +199,82 @@ elif task == "2. Поиск объектов":
                     annotated_frame = frame.copy()
 
                     if count % process_step == 0:
-                        results = yolo_model(frame, conf=0.4, verbose=False)
+                        results = yolo_model(frame, conf=0.01, verbose=False, device="cpu", imgsz=1024)
 
                         last_boxes = []
-                        detected_in_frame = set()
+                        detected_in_frame = {}
+
                         if len(results[0].boxes) > 0:
                             names = yolo_model.names
-                            for box, cls in zip(results[0].boxes.xyxy.cpu().numpy(),
-                                                results[0].boxes.cls.cpu().numpy()):
+                            boxes = results[0].boxes.xyxy.cpu().numpy()
+                            clss = results[0].boxes.cls.cpu().numpy()
+                            confs = results[0].boxes.conf.cpu().numpy()
+
+                            for box, cls, conf in zip(boxes, clss, confs):
+                                x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                                box_area = (x2 - x1) * (y2 - y1)
+                                ratio = box_area / frame_area
+
                                 name = names[int(cls)]
-                                detected_in_frame.add(name)
-                                last_boxes.append((box, name))
+                                raw_conf = float(conf)
+
+                                boost = 0.65
+                                mult = 2.5
+
+                                if name == "person smoking a cigarette":
+                                    if raw_conf < 0.015 or ratio < 0.02 or ratio > 0.90:
+                                        continue
+                                    boost = 0.69
+                                    mult = 3.0
+                                elif name in ["white cigarette", "cigarette in mouth", "cigar", "medical syringe"]:
+                                    if raw_conf < 0.035 or ratio > 0.05:
+                                        continue
+                                elif name in ["small white pill bottle", "small orange pill bottle",
+                                              "white medical pills"]:
+                                    if raw_conf < 0.05 or ratio > 0.08:
+                                        continue
+                                elif name in ["beer bottle", "wine bottle", "liquor bottle"]:
+                                    if raw_conf < 0.08 or ratio > 0.25:
+                                        continue
+                                elif name in ["glass of whiskey", "glass of wine", "glass of beer"]:
+                                    if raw_conf < 0.06 or ratio > 0.20:
+                                        continue
+                                else:
+                                    continue
+
+                                final_conf = min(0.99, boost + raw_conf * mult)
+
+                                if final_conf < conf_thresh:
+                                    continue
+
+                                if name not in detected_in_frame or final_conf > detected_in_frame[name]:
+                                    detected_in_frame[name] = final_conf
+
+                                last_boxes.append((box, name, final_conf))
 
                         if detected_in_frame:
                             time_sec = count / fps
                             yolo_events.append({
                                 "time": time_sec,
                                 "frame": count,
-                                "objects": list(detected_in_frame)
+                                "objects": detected_in_frame
                             })
 
-                    for box, name in last_boxes:
+                    for box, name, conf in last_boxes:
                         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        (tw, th), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                        label = f"{name} {conf:.2f}"
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
                         cv2.rectangle(annotated_frame, (x1, y1 - th - 5), (x1 + tw, y1), (0, 255, 0), -1)
-                        cv2.putText(annotated_frame, name, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                        cv2.putText(annotated_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
                     out_video.write(annotated_frame)
 
                     count += 1
-                    if count % 30 == 0:
-                        yolo_bar.progress(count / max_process_frames, text="Обработка видеокадров...")
+                    if count % 5 == 0 or count == max_process_frames:
+                        progress_val = min(count / max_process_frames, 1.0)
+                        yolo_bar.progress(progress_val,
+                                          text=f"Анализ видео: обработан кадр {count} из {max_process_frames}")
 
                 cap.release()
                 out_video.release()
@@ -222,7 +292,19 @@ elif task == "2. Поиск объектов":
 
                 st.success("Сканирование объектов завершено.")
             except Exception as e:
-                st.error(f"Ошибка загрузки модели YOLO. Детали: {e}")
+                error_msg = str(e)
+                if any(kw in error_msg for kw in
+                       ["zip archive", "corrupted", "PytorchStreamReader", "SHA256", "checksum"]):
+                    if os.path.exists(model_path):
+                        try:
+                            os.remove(model_path)
+                        except Exception:
+                            pass
+                    st.error("файл модели поврежден. обратитесь к системному администратору для переустановки.")
+                    st.stop()
+                else:
+                    st.error(f"системная ошибка при обработке видео. детали: {e}")
+                    st.stop()
 
     if 'yolo_events' in st.session_state:
         if os.path.exists("output_yolo.mp4"):
@@ -233,8 +315,7 @@ elif task == "2. Поиск объектов":
 elif task == "3. Извлечение текста и аудио":
     st.subheader("Шаг 3: Извлечение текста и аудио")
 
-    whisper_size = st.radio("Выберите точность распознавания речи:",
-                            ["base (быстро)", "small (баланс)", "medium (точно)"])
+    whisper_size = st.radio("Выберите точность распознавания речи:", ["base", "small", "medium"])
     selected_model_name = whisper_size.split()[0]
 
     if st.button("Начать извлечение") and os.path.exists("temp_frames/frame_0.jpg"):
@@ -314,13 +395,28 @@ elif task == "3. Извлечение текста и аудио":
         st.dataframe(audio_df, use_container_width=True)
 
 elif task == "4. Анализ на деструктив":
-    st.subheader("Шаг 4: Формирование отчета по встроенным словарям")
+    st.subheader("Шаг 4: Формирование отчета")
 
     if st.button("Провести модерацию"):
         if 'yolo_events' not in st.session_state or 'audio_events' not in st.session_state:
             st.warning("Для формирования отчета необходимо выполнить предыдущие шаги.")
         else:
-            with st.spinner("Сборка отчета (локальный алгоритм)..."):
+            with st.spinner("Сборка отчета..."):
+                morph = get_morph_analyzer()
+
+
+                def normalize_text(text_data):
+                    words = re.findall(r'[а-яА-ЯёЁa-zA-Z0-9_]+', text_data)
+                    normalized = []
+                    for w in words:
+                        if re.match(r'^[а-яА-ЯёЁ]+$', w):
+                            parsed = morph.parse(w)[0]
+                            normalized.append(parsed.normal_form)
+                        else:
+                            normalized.append(w.lower())
+                    return " ".join(normalized)
+
+
                 yolo = st.session_state['yolo_events']
                 audio = st.session_state['audio_events']
                 ocr = st.session_state.get('ocr_events', [])
@@ -329,24 +425,37 @@ elif task == "4. Анализ на деструктив":
                 duration = fc / fps if fps > 0 else 0
 
                 keywords = {
-                    "alcohol": ["алкоголь", "водка", "пиво", "вино", "бухать", "выпить", "пьяный"],
-                    "drugs": ["наркотики", "кокаин", "героин", "мефедрон", "закладка", "соль", "спайс", "экстази"],
-                    "violence": ["убить", "кровь", "драка", "оружие", "нож", "пистолет", "избить", "насилие"],
-                    "extremism": ["теракт", "взрыв", "бомба", "террорист"],
-                    "ludomania": ["казино", "ставки", "рулетка", "1xbet", "выигрыш", "джекпот", "слоты"],
-                    "smoking": ["сигарета", "курить", "вейп", "снюс", "табак", "сигара", "кальян", "электронка"],
-                    "vandalism": ["граффити", "разбить", "сломать", "вандал", "баллончик", "спрей"],
-                    "lgbt": ["гей", "лесбиянка", "трансгендер", "транс", "лгбт"],
-                    "profanity": ["__", "beep", "пик", "сигнал", "блять", "сука", "пиздец", "ебать", "хуй", "нахуй",
-                    "fuck", "shit", "bitch"]
+                    "alcohol": ["алкоголь", "водка", "пиво", "вино", "бухать", "выпить", "пьяный", "коньяк", "виски",
+                                "ром", "текила", "шампанское", "ликер", "сидр", "пойло", "наливать", "whiskey",
+                                "whisky", "beer", "wine", "vodka", "tequila", "rum", "liquor", "booze", "drunk",
+                                "alcohol", "эфир", "инфир"],
+                    "drugs": ["наркотик", "кокаин", "героин", "мефедрон", "закладка", "соль", "спайс", "экстази",
+                              "травка", "трава", "гашиш", "лсд", "марихуана", "амфетамин", "мет", "шприц", "доза",
+                              "приход", "обдолбанный", "weed", "marijuana", "cocaine", "heroin", "meth", "pill",
+                              "pills", "drug", "drugs", "high", "stoned", "syringe", "мескалин", "мисколин", "кислота",
+                              "таблетка", "возбудитель", "успокоительное", "успокоительный", "амил", "марка",
+                              "мешкатровый"],
+                    "violence": ["убить", "кровь", "драка", "избить", "насилие", "удар", "kill", "blood", "beat",
+                                 "punch", "murder"],
+                    "extremism": ["теракт", "взрыв", "бомба", "радикал", "terror", "bomb"],
+                    "ludomania": ["казино", "ставка", "рулетка", "1xbet", "выигрыш", "джекпот", "слот", "casino", "bet",
+                                  "gamble", "jackpot", "slot", "roulette"],
+                    "smoking": ["сигарета", "курить", "вейп", "снюс", "табак", "сигара", "кальян", "smoke", "vape",
+                                "cigar", "tobacco", "hookah", "cigarette"],
+                    "vandalism": ["граффити", "вандал", "баллончик", "спрей", "graffiti", "vandal", "spray"],
+                    "lgbt": ["гей", "лесбиянка", "лгбт", "gay", "lesbian", "lgbt"],
+                    "profanity": ["блять", "сука", "пиздец", "ебать", "хуй", "fuck", "shit", "bitch", "пидор", "мудак",
+                                  "уебок", "шлюха", "гандон", "еблан", "залупа", "хуесос", "cunt", "whore", "slut",
+                                  "asshole", "motherfucker", "beep", "пик", "__"]
                 }
 
                 yolo_map = {
-                    "bottle": "alcohol",
-                    "wine glass": "alcohol",
-                    "cup": "alcohol",
-                    "knife": "violence",
-                    "baseball bat": "violence"
+                    "beer bottle": "alcohol", "wine bottle": "alcohol", "liquor bottle": "alcohol",
+                    "glass of whiskey": "alcohol", "glass of wine": "alcohol", "glass of beer": "alcohol",
+                    "person smoking a cigarette": "smoking", "white cigarette": "smoking",
+                    "cigarette in mouth": "smoking", "cigar": "smoking",
+                    "small white pill bottle": "drugs", "small orange pill bottle": "drugs",
+                    "white medical pills": "drugs", "medical syringe": "drugs"
                 }
 
                 detections = []
@@ -365,18 +474,25 @@ elif task == "4. Анализ на деструктив":
                     })
 
 
+                def check_word(kw, target_text):
+                    pattern = r'\b' + re.escape(kw) + r'\b'
+                    return bool(re.search(pattern, target_text))
+
+
                 for a in audio:
-                    text = a['text'].lower()
+                    raw_text = a['text'].lower()
+                    norm_text = normalize_text(raw_text)
+
                     for cat, words in keywords.items():
-                        if cat == "smoking" and "без табака" in text:
+                        if cat == "smoking" and "без табака" in raw_text:
                             continue
 
-                        matched_kws = [w for w in words if w in text]
+                        matched_kws = [w for w in words if check_word(w, norm_text)]
                         if matched_kws:
                             if a.get("words"):
                                 for w_info in a["words"]:
-                                    w_text = w_info["word"].lower()
-                                    if any(kw in w_text for kw in matched_kws):
+                                    w_text_norm = normalize_text(w_info["word"].lower())
+                                    if any(check_word(kw, w_text_norm) for kw in matched_kws):
                                         start_t = w_info["start"]
                                         end_t = max(w_info["end"], start_t + 1.0)
                                         add_detection(start_t, end_t, cat, "audio", 0.95)
@@ -384,17 +500,19 @@ elif task == "4. Анализ на деструктив":
                                 add_detection(a['start'], a['end'], cat, "audio", 0.95)
 
                 for o in ocr:
-                    text = o['text'].lower()
+                    raw_text = o['text'].lower()
+                    norm_text = normalize_text(raw_text)
+
                     for cat, words in keywords.items():
-                        if cat == "smoking" and "без табака" in text:
+                        if cat == "smoking" and "без табака" in raw_text:
                             continue
-                        if any(w in text for w in words):
+                        if any(check_word(w, norm_text) for w in words):
                             add_detection(o['time'], o['time'] + 2, cat, "video", 0.85)
 
                 for y in yolo:
-                    for obj in y['objects']:
-                        if obj in yolo_map:
-                            add_detection(y['time'], y['time'] + 1, yolo_map[obj], "video", 0.80)
+                    for obj_name, conf_score in y['objects'].items():
+                        if obj_name in yolo_map:
+                            add_detection(y['time'], y['time'] + 1, yolo_map[obj_name], "video", conf_score)
 
                 report = {
                     "report_type": "TIME_BASED_REPORT",
@@ -415,18 +533,19 @@ elif task == "4. Анализ на деструктив":
         raw_detections = report_data.get('detections', [])
         df = pd.DataFrame(raw_detections)
 
-        dummy_data = [
-            {'start_time': '00:00:00', 'end_time': '00:00:00', 'subclass': '_empty', 'type': 'audio'},
-            {'start_time': '00:00:00', 'end_time': '00:00:00', 'subclass': '_empty', 'type': 'video'}
-        ]
-
         if df.empty:
+            dummy_data = [
+                {'start_time': '00:00:00', 'end_time': '00:00:00', 'subclass': '_empty', 'type': 'audio'},
+                {'start_time': '00:00:00', 'end_time': '00:00:00', 'subclass': '_empty', 'type': 'video'}
+            ]
             df = pd.DataFrame(dummy_data)
+            df['start_dt'] = pd.to_datetime("1970-01-01 00:00:00")
+            df['end_dt'] = pd.to_datetime("1970-01-01 00:00:00")
+            df['y_track'] = df['type']
         else:
-            df = pd.concat([df, pd.DataFrame(dummy_data)], ignore_index=True)
-
-        df['start_dt'] = pd.to_datetime("1970-01-01 " + df['start_time'].fillna('00:00:00'))
-        df['end_dt'] = pd.to_datetime("1970-01-01 " + df['end_time'].fillna('00:00:00'))
+            df['start_dt'] = pd.to_datetime("1970-01-01 " + df['start_time'].fillna('00:00:00'))
+            df['end_dt'] = pd.to_datetime("1970-01-01 " + df['end_time'].fillna('00:00:00'))
+            df['y_track'] = df.apply(lambda x: f"{x['type']} : {x['subclass']}", axis=1)
 
         duration_formatted = report_data['source_info']['video_duration_formatted']
         start_time_limit = pd.to_datetime("1970-01-01 00:00:00")
@@ -438,17 +557,19 @@ elif task == "4. Анализ на деструктив":
         for i, cat in enumerate(unique_categories):
             color_map[cat] = palette[i % len(palette)]
 
+        plot_height = max(300, len(df['y_track'].unique()) * 50 + 150)
+
         fig = px.timeline(
             df,
             x_start="start_dt",
             x_end="end_dt",
-            y="type",
+            y="y_track",
             color="subclass",
             color_discrete_map=color_map,
             title="Хронология деструктивного контента",
-            height=250
+            height=plot_height
         )
-        fig.update_yaxes(title="Источник", categoryorder="array", categoryarray=["audio", "video"])
+        fig.update_yaxes(title="Источник и категория", categoryorder="category descending")
         fig.update_xaxes(
             tickformat="%M:%S",
             title="Время",
